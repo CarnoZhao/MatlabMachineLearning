@@ -28,12 +28,14 @@ function model()
     loss(x, y) = crossentropy(chain(x), y)
     accuracy(x, y) = mean(onecold(chain(x)) .== onecold(y))
     ps = params(chain)
-    data = repeated((X, Y), 1000)
+    data = repeated((X, Y), 1500)
     evalcb = () -> @show(loss(X, Y))
     opt = AdaMax()
     Flux.train!(loss, ps, data, opt, cb = throttle(evalcb, 1))
-    println("Accuracy in training: $(accuracy(X, Y))")
-    println("Accuracy in test: $(accuracy(tX, tY))")
+    println("Accuracy in training: $(accuracy(X, Y) * 100)%")
+    println("Accuracy in test: $(accuracy(tX, tY) * 100)%")
 end
 
 model();
+# Accuracy in training: 96.25333333333333%
+# Accuracy in test: 95.22%

@@ -76,3 +76,5 @@ model = build_model()
 train_loader, test_loader = load_data()
 accuracy(model, train_loader, 'training set')
 accuracy(model, test_loader, 'test set')
+# Accuracy in training set: 93.418%
+# Accuracy in test set: 93.490%

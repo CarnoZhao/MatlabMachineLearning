@@ -38,8 +38,9 @@ function model()
     Flux.train!(loss, parameters, data, optimizer, cb = throttle(callback, 5))
     println("Accuracy in training: $(accuracy(X, Y) * 100)%")
     println("Accuracy in test: $(accuracy(tX, tY) * 100)%")
+    net
 end
 
-model();
+net = model();
 # Accuracy in training: 99.9074074074074%
 # Accuracy in test: 80.83333333333333%

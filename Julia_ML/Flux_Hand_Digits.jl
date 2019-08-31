@@ -14,7 +14,7 @@ function load_data()
     X, Y, tX, tY
 end
 
-function model()
+function model(num_iterations = 3000, learning_rate = 0.0001, beta1 = 0.9, beta2 = 0.999)
     X, Y, tX, tY = load_data()
     train_m = size(X)[ndims(X)]
     test_m = size(tX)[ndims(tX)]
@@ -23,7 +23,8 @@ function model()
     Y = reshape(Y, :, train_m) |> gpu
     tY = reshape(tY, :, test_m) |> gpu
     net = Chain(
-        Dense(size(X)[1], 50, relu, initW = glorot_normal),
+        Dense(size(X)[1], 100, relu, initW = glorot_normal),
+        Dense(100, 50, relu, initW = glorot_normal),
         Dense(50, 20, relu, initW = glorot_normal),
         Dense(20, 10, relu, initW = glorot_normal),
         Dense(10, size(Y)[1], initW = glorot_normal),
@@ -34,13 +35,14 @@ function model()
     parameters = params(net)
     data = repeated((X, Y), 5000)
     callback = () -> @show(loss(X, Y))
-    optimizer = AdaMax()
+    optimizer = AdaMax(learning_rate, (beta1, beta2))
     Flux.train!(loss, parameters, data, optimizer, cb = throttle(callback, 5))
-    println("Accuracy in training: $(accuracy(X, Y) * 100)%")
-    println("Accuracy in test: $(accuracy(tX, tY) * 100)%")
+    println("Accuracy in training: $(round(accuracy(X, Y) * 100, digits = 4))%")
+    println("Accuracy in test: $(round(accuracy(tX, tY) * 100, digits = 4))%")
     net
 end
 
-net = model();
-# Accuracy in training: 99.9074074074074%
-# Accuracy in test: 80.83333333333333%
+net = model(3000, 0.0001, 0.9, 0.9999);
+# best results
+# Accuracy in training: 100.0%
+# Accuracy in test: 87.50%

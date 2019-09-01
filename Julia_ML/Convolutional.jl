@@ -3,6 +3,7 @@ using CUDAdrv, CuArrays
 
 onehot(Y, rng) = Int.(rng .== reshape(Y, 1, :))
 relu(x) = max(0, x)
+drelu(x) = ifelse(x > 0, 1, 0)
 softmax(X) = exp.(X) / sum(exp.(X))
 
 function load_data()
@@ -89,13 +90,26 @@ function forward(X, conv_parameters, fc_parameters, conv_dims, pool_dims, fc_dim
         P = pool_forward(Z, f_pool, s_pool, mode)
         A = P
     end
+    flat_dims = size(A)
     A = reshape(A, size(A)[1], :)'
     for fc_idx in 1:length(fc_dims)
         W, b = fc_parameters[fc_idx]
         Z = W * A .+ b
         A = (fc_idx == length(fc_dims) ? softmax : relu)(Z)
     end
-    A, conv_caches, fc_caches
+    A, conv_caches, fc_caches, flat_dims
 end
 
-function backward()
+function backward(A, Y, conv_caches, fc_caches, conv_parameters, fc_parameters)
+    m = size(Y)[2]
+    dA = A - Y
+    conv_grads = []
+    fc_grads = []
+    for fc_idx in length(fc_caches):-1:1
+        A, A_prev, W = fc_caches[fc_idx]
+        dZ = dA .* ifelse(fc_idx == length(fc_caches), 1, drelu(A_prev))
+        dW = dZ * A_prev' / m
+        db = mean(dZ, dims = 1)
+        dA = W' * dZ
+    end
+    dP = reshape(dA', )

@@ -1,14 +1,22 @@
 using HDF5, Statistics
-using CUDAdrv, CuArrays
+using CUDAdrv, CuArrays, GPUArrays, CUDAnative
+# GPUArrays.allowscalar(false)
 use_gpu = true
 dev = use_gpu ? CuArrays.CuArray : Array
+sum = use_gpu ? CUDAnative.sum : Base.sum
+max = use_gpu ? CUDAnative.max : Base.max
 
 onehot(Y, rng) = Int.(rng .== reshape(Y, 1, :))
-onecold(Y) = [Int(idx[1]) for idx in argmax(Y, dims = 1)]
-relu(x) = max(0, x)
-drelu(x) = ifelse(x > 0, 1, 0)
-softmax(X) = exp.(X) / sum(exp.(X))
+onecold(Y) = [Int(idx[1]) - 1 for idx in argmax(Y, dims = 1)]
+relu(x) = max.(0, x)
+drelu(x) = ifelse.(x .> 0, 1, 0)
+softmax(X) = exp.(X) ./ sum(exp.(X), dims = 1)
 slice(h, w, f, s) = ((h - 1) * s + 1:(h - 1) * s + f, (w - 1) * s + 1:(w - 1) * s + f)
+devz(x...) = dev(zeros(x...))
+devc(x) = dev(zeros(size(x)))
+crossentropy(AL, Y) = -mean(sum(Y .* log.(AL), dims = 1))
+dims_mapping(nH, nW, f, p, s) = (Int((nH + 2 * p - f) / s + 1), Int((nW + 2 * p - f) / s + 1))
+flat(P) = (reshape(P, :, size(P)[ndims(P)]), size(P))
 
 function load_data()
     train_data = read(h5open("/data/tongxueqing/zhaox/train_signs.h5"))
@@ -22,189 +30,202 @@ function load_data()
     [dev(arr) for arr in (X, Y, tX, tY)]
 end
 
-function init_conv_parameters(X_dims, conv_dims)
-    conv_parameters = []
-    nH, nW, nc_in, m = X_dims
-    for conv_dim in conv_dims
-        f, s, p, nc_out = conv_dim
-        W = randn(f, f, nc_in, nc_out) * sqrt(2 / (nH * nW * nc_in))
-        b = zeros(1, 1, 1, nc_out)
-        push!(conv_parameters, [dev(W), dev(b)])
-        nH = Int((nH + 2 * p - f) / s + 1)
-        nW = Int((nW + 2 * p - f) / s + 1)
-        nc_in = nc_out
+function init_cvParams(X_dims, cvDims)
+    cvParams = []
+    nH, nW, nCin, m = X_dims
+    for cvdim in cvDims
+        f, s, p, nCout = cvdim
+        W = randn(f, f, nCin, nCout) * sqrt(2 / (nH * nW * nCin))
+        b = zeros(1, 1, nCout)
+        push!(cvParams, [dev(W), dev(b)])
+        nH, nW = dims_mapping(nH, nW, f, p, s)
+        nCin = nCout
     end
-    conv_V = [[dev(zeros(size(para))) for para in paras] for paras in conv_parameters]
-    conv_S = deepcopy(conv_V)
-    conv_parameters, conv_S, conv_V
+    cvV = [[devc(para) for para in paras] for paras in cvParams]
+    cvS = deepcopy(cvV)
+    cvParams, cvS, cvV
 end
 
-function init_fc_parameters(fc_dims)
-    fc_parameters = []
-    L = length(fc_dims) - 1
+function init_fcParams(fcDims)
+    fcParams = []
+    L = length(fcDims) - 1
     for i in 1:L
-        W = randn(fc_dims[i], fc_dims[i + 1]) * sqrt(2 / fc_dims[i])
-        b = zeros(fc_dims[i + 1])
-        push!(fc_parameters, [dev(W), dev(b)])
+        W = randn(fcDims[i + 1], fcDims[i]) * sqrt(2 / fcDims[i])
+        b = zeros(fcDims[i + 1], 1)
+        push!(fcParams, [dev(W), dev(b)])
     end
-    fc_V = [[dev(zeros(size(para))) for para in paras] for paras in fc_parameters]
-    fc_S = deepcopy(fc_V)
-    fc_parameters, fc_V, fc_S
+    fcV = [[devc(para) for para in paras] for paras in fcParams]
+    fcS = deepcopy(fcV)
+    fcParams, fcV, fcS
 end
 
 function padding(X, p)
-    nH, nW, nc, m = size(X)
-    newX = dev(zeros(nH + 2 * p, nW + 2 * p, nc, m))
+    nH, nW, nC, m = size(X)
+    newX = devz(nH + 2 * p, nW + 2 * p, nC, m)
     newX[p + 1:p + nH, p + 1:p + nW, :, :] = X
     newX
 end
 
-function conv_forward(X, W, b, f, s, p, nc_out)
-    nH_in, nW_in, nc_in, m = size(X)
+function conv(X, params, hparams)
+    W, b = params
+    s, p = hparams
+    nHin, nWin, nCin, m = size(X)
+    f, f, nCin, nCout = size(W)
     X = padding(X, p)
-    nH = Int((nH_in + 2 * p - f) / s + 1)
-    nW = Int((nW_in + 2 * p - f) / s + 1)
-    Z = dev(zeros(nH, nW, nc_out, m))
-    for h in 1:nH, w in 1:nW, i in 1:m
-        h_slice, w_slice = slice(h, w, f, s)
-        Z[h, w, :, i] = sum(X[h_slice, w_slice, :, i] .* W, dims = (1, 2, 4)) .+ b
-        println("$(h), $(w), $(i)")
+    nH, nW = dims_mapping(nHin, nWin, f, p, s)
+    Z = devz(nH, nW, nCout, m)
+    for h in 1:nH, w in 1:nW
+        hSlice, wSlice = slice(h, w, f, s)
+        tmp = reshape(X[hSlice, wSlice, :, :], f, f, nCin, 1, m) .* reshape(W, f, f, nCin, nCout, 1)
+        Z[h, w, :, :] = reshape(sum(tmp, dims = 1:3), 1, 1, nCout, m)
     end
-    Z
+    relu(Z .+ b)
 end 
 
-function pool_forward(Z, f, s, mode)
-    nH_in, nW_in, nc_in, m = size(Z)
-    nH = Int((nH_in - f) / s + 1)
-    nW = Int((nW_in - f) / s + 1)
-    P = dev(zeros(nH, nW, nc_in, m))
-    for h in 1:nH, w in 1:nW, i in 1:m
-        h_slice, w_slice = slice(h, w, f, s)
-        P[h, w, :, i] = (mode == "max" ? maximum : mean)(Z[h_slice, w_slice, :, i], dims = 1:2)
+function pool(Z, hparams)
+    f, s, mode = hparams
+    nHin, nWin, nCin, m = size(Z)
+    nH, nW = dims_mapping(nHin, nWin, f, 0, s)
+    P = devz(nH, nW, nCin, m)
+    func = mode == "max" ? maximum : mean
+    for h in 1:nH, w in 1:nW
+        hSlice, wSlice = slice(h, w, f, s)
+        P[h, w, :, :] = func(Z[hSlice, wSlice, :, :])
     end
     P
 end
 
-function forward(X, conv_parameters, fc_parameters, conv_dims, pool_dims, fc_dims)
-    A = X
-    conv_caches = []
-    for conv_idx in 1:length(conv_dims)
-        push!(conv_caches, [A])
-        W, b = conv_parameters[conv_idx]
-        f, s, p, nc_out = conv_dims[conv_idx]
-        f_pool, s_pool, mode = pool_dims[conv_idx]
-        Z = conv_forward(A, W, b, f, s, p, nc_out)
-        Z = relu.(Z)
-        push!(conv_caches[length(conv_caches)], Z)
-        P = pool_forward(Z, f_pool, s_pool, mode)
-        A = P
-    end
-    flat_dims = size(A)
-    A = reshape(A, :, flat_dims[ndims(A)])
-    fc_caches = [A]
-    for fc_idx in 1:length(fc_dims)
-        W, b = fc_parameters[fc_idx]
-        Z = W * A .+ b
-        A = (fc_idx == length(fc_dims) ? softmax : relu)(Z)
-        push!(fc_caches, A)
-    end
-    A, conv_caches, fc_caches, flat_dims
+function fc(A, params, useSoftmax)
+    W, b = params
+    Z = W * A .+ b
+    A = (useSoftmax ? softmax : relu)(Z)
+    A
 end
 
-function backward(AL, Y, conv_caches, fc_caches, conv_parameters, fc_parameters, conv_dims, pool_dims, flat_dims)
+function forward(P, cvParams, fcParams, cvDims, plDims, fcDims)
+    cvCaches = []
+    for cvIdx in 1:length(cvDims)
+        A = conv(P, cvParams[cvIdx], cvDims[cvIdx][2:3])
+        push!(cvCaches, [P, A])
+        P = pool(A, plDims[cvIdx])
+    end
+    A, flatDims = flat(P)
+    fcCaches = [A]
+    for fcIdx in 1:length(fcDims) - 1
+        A = fc(A, fcParams[fcIdx], fcIdx == length(fcDims) - 1)
+        push!(fcCaches, A)
+    end
+    A, cvCaches, fcCaches, flatDims
+end
+
+function fcback(dA, fcCaches, fcParams, fcIdx, m)
+    A, A_prev = fcCaches[fcIdx + 1], fcCaches[fcIdx]
+    W = fcParams[fcIdx][1]
+    dZ = dA .* ifelse(fcIdx == length(fcCaches) - 1, 1, drelu(A))
+    dW = dZ * A_prev' / m
+    db = mean(dZ, dims = 2)
+    dA = W' * dZ
+    dA, dW, db
+end
+
+function poolback(dP, A, cvIdx, plDims, m)
+    nH, nW, nCout = size(dP)
+    plf, pls, mode = plDims[cvIdx]
+    dA = devc(A)
+    for h in 1:nH, w in 1:nW
+        hSlice, wSlice = slice(h, w, plf, pls)
+        if mode == "max"
+            Aslice = A[hSlice, wSlice, :, :]
+            dpool = Aslice .== maximum(Aslice)
+        else
+            dpool = ones(plf, plf, nCout, m) / plf ^ 2
+        end
+        dA[hSlice, wSlice, :, :] .+= dpool .* dP[h:h, w:w, :, :]
+    end
+    dA .* drelu(A)
+end
+
+function convback(dZ, Pprev, cvParams, cvDims, cvIdx, m)
+    W, b = cvParams[cvIdx]
+    f, s, p, nCout = cvDims[cvIdx]
+    f, f, nCin, nCout = size(W)
+    nH, nW, nCout, m = size(dZ)
+    dP = devz(size(Pprev) .+ (2 * p, 2 * p, 0, 0))
+    dW, db = devc(W), devc(b)
+    Pprev = padding(Pprev, p)
+    for h in 1:nH, w in 1:nW
+        hSlice, wSlice = slice(h, w, f, s)
+        tmp = reshape(W, f, f, nCin, nCout, 1) .* reshape(dZ[h, w, :, :], 1, 1, 1, nCout, m)
+        dP[hSlice, wSlice, :, :] .+= dropdims(sum(tmp, dims = 4), dims = 4)
+        tmp = reshape(Pprev[hSlice, wSlice, :, :], f, f, nCin, 1, m) .* reshape(dZ[h, w, :, :], 1, 1, 1, nCout, m)
+        dW .+= dropdims(mean(tmp, dims = 5), dims = 5)
+    end
+    db = dropdims(mean(sum(dZ, dims = 1:2), dims = 4), dims = 4)
+    dP = dP[p + 1:size(dP)[1] - p, p + 1:size(dP)[2] - p, :, :]
+    dP, dW, db
+end
+
+function backward(AL, Y, cvCaches, fcCaches, cvParams, fcParams, cvDims, plDims, flatDims)
     m = size(Y)[2]
     dA = AL - Y
-    fc_grads = []
-    for fc_idx in length(fc_caches):-1:2
-        A, A_prev = fc_caches[fc_idx], fc_caches[fc_idx - 1]
-        W = fc_parameters[fc_idx][1]
-        dZ = dA .* ifelse(fc_idx == length(fc_caches), 1, drelu(A))
-        dW = dZ * A_prev' / m
-        db = mean(dZ, dims = 1)
-        dA = W' * dZ
-        push!(fc_grads, [dW, db])
+    fcGrads = []
+    for fcIdx in length(fcCaches) - 1:-1:1
+        dA, dW, db = fcback(dA, fcCaches, fcParams, fcIdx, m)
+        push!(fcGrads, [dW, db])
     end
-    dP = reshape(dA', flat_dims)
-    conv_grads = []
-    for conv_idx in length(conv_caches):-1:1
-        nH, nW, nc = size(dP)
-        P_prev, A = conv_caches[conv_idx]
-        W, b = conv_parameters[conv_idx]
-        f_pool, s_pool, mode = pool_dims[conv_idx]
-        f, s, p, nc = conv_dims[conv_idx]
-        dA = zeros(size(A) .+ [2 * p, 2 * p, 0, 0])
-        dW = zeros(size(W))
-        db = zeros(b)
-        for h in 1:nH, w in 1:nW, i in 1:m
-            h_slice, w_slice = slice(h, w, f_pool, s_pool)
-            if mode == "max"
-                A_slice = A[h_slice, w_slice, :, i]
-                dpool = A_slice .== maximum(A_slice, dims = (1, 2, 4))
-            else
-                dpool = ones(f_pool, f_pool) / f_pool ^ 2
-                dA[h_slice, w_slice, :, i] .+= dpool .* dP[h, w, :, i]
-            end
-            dA = dA[p + 1:size(dA)[1] - p, p + 1:size(dA)[2] - p, :, :]
-        end
-        dZ = dA .* drelu(A)
-        nH, nW, nc = size(dZ)
-        for h in 1:nH, w in 1:nW, i in 1:m
-            h_slice, w_slice = slice(h, w, f, s)
-            dP[h_slice, w_slice, :, i] .+= W .* dZ[h, w, :, i]
-            dW .+= P_prev[h_slice, w_slice, :, i] .* dZ[h, w, :, i] / m
-            db .+= dZ[h, w, :, i] / m
-            push!(conv_grads, [dW, db])
-        end
+    dP = reshape(dA', flatDims)
+    cvGrads = []
+    for cvIdx in length(cvCaches):-1:1
+        Pprev, A = cvCaches[cvIdx]
+        dZ = poolback(dP, A, cvIdx, plDims, m)
+        dP, dW, db = convback(dZ, Pprev, cvParams, cvDims, cvIdx, m)
+        push!(cvGrads, [dW, db])
     end
-    conv_grads, fc_grads
+    cvGrads, fcGrads
 end
 
-function update_parameters(conv_parameters, fc_parameters, conv_grads, fc_grads, learning_rate, beta1, beta2, epsilon, conv_V, conv_S, fc_V, fc_S, t)
-    combines = ((conv_parameters, conv_grads, conv_V, conv_S), (fc_parameters, fc_grads, fc_V, fc_S))
+function update_parameters(cvParams, fcParams, cvGrads, fcGrads, learnRate, beta1, beta2, epsilon, cvV, cvS, fcV, fcS, t)
+    combines = ((cvParams, cvGrads, cvV, cvS), (fcParams, fcGrads, fcV, fcS))
     for (P, G, V, S) in combines, i in 1:length(P), j in (1, 2)
         L = length(P)
         V[i][j] = beta1 * V[i][j] + (1 - beta1) * G[L - i + 1][j]
         S[i][j] = beta2 * S[i][j] + (1 - beta2) * G[L - i + 1][j] .^ 2
-        V_cor = V[i][j] / (1 - beta1 ^ t)
-        S_cor = S[i][j] / (1 - beta2 ^ t)
-        P[i][j] -= learning_rate * V_cor ./ (sqrt.(S_cor) .+ epsilon)
+        VCorr = V[i][j] / (1 - beta1 ^ t)
+        SCorr = S[i][j] / (1 - beta2 ^ t)
+        P[i][j] -= learnRate * VCorr ./ (sqrt.(SCorr) .+ epsilon)
     end
 end
 
-function compute_cost(AL, Y)
-    mean(sum(Y .* log.(AL), dims = 1))
-end
-
-function predict(X, Y, conv_parameters, fc_parameters, conv_dims, pool_dims, fc_dims, name)
-    AL, _, _, _ = forward(X, conv_parameters, fc_parameters, conv_dims, pool_dims, fc_dims)
+function predict(X, Y, cvParams, fcParams, cvDims, plDims, fcDims, name)
+    AL, _, _, _ = forward(X, cvParams, fcParams, cvDims, plDims, fcDims)
     accuarcy = mean(onecold(AL) .== onecold(Y)) * 100
     println("Accuracy in $(name) set: $(accuarcy)")
 end
 
-function cnn(X, Y, conv_dims, pool_dims, fc_dims, num_iterations, learning_rate, beta1, beta2, epsilon)
-    conv_parameters, conv_V, conv_S = init_conv_parameters(size(X), conv_dims)
-    fc_parameters, fc_V, fc_S = init_fc_parameters(fc_dims)
+function cnn(X, Y, cvDims, plDims, fcDims, num_iterations, learnRate, beta1, beta2, epsilon)
+    cvParams, cvV, cvS = init_cvParams(size(X), cvDims)
+    fcParams, fcV, fcS = init_fcParams(fcDims)
     for t in 1:num_iterations
-        AL, conv_caches, fc_caches, flat_dims = forward(X, conv_parameters, fc_parameters, conv_dims, pool_dims, fc_dims)
-        conv_grads, fc_grads = backward(AL, Y, conv_caches, fc_caches, conv_parameters, fc_parameters, conv_dims, pool_dims, flat_dims)
-        update_parameters(conv_parameters, fc_parameters, conv_grads, fc_grads, learning_rate, beta1, beta2, epsilon, conv_V, conv_S, fc_V, fc_S, t)
+        AL, cvCaches, fcCaches, flatDims = forward(X, cvParams, fcParams, cvDims, plDims, fcDims)
+        cvGrads, fcGrads = backward(AL, Y, cvCaches, fcCaches, cvParams, fcParams, cvDims, plDims, flatDims)
+        update_parameters(cvParams, fcParams, cvGrads, fcGrads, learnRate, beta1, beta2, epsilon, cvV, cvS, fcV, fcS, t)
         if t % 1 == 0
-            cost = compute_cost(AL, Y)
+            cost = crossentropy(AL, Y)
             println("Cost after iteration $(t): $(cost)")
         end
     end
-    conv_parameters, fc_parameters
+    cvParams, fcParams
 end
 
-function main(num_iterations = 2, learning_rate = 0.0001, beta1 = 0.9, beta2 = 0.999, epsilon = 1e-8)
+function main(num_iterations = 100, learnRate = 0.0001, beta1 = 0.9, beta2 = 0.999, epsilon = 1e-8)
     X, Y, tX, tY = load_data()
-    conv_dims = [[5, 1, 2, 8], [3, 1, 1, 16]]
-    pool_dims = [[8, 8, "max"], [4, 4, "max"]]
-    fc_dims = [64, 20, 6]
-    conv_parameters, fc_parameters = cnn(X, Y, conv_dims, pool_dims, fc_dims, num_iterations, learning_rate, beta1, beta2, epsilon)
-    predict(X, Y, conv_parameters, fc_parameters, conv_dims, pool_dims, fc_dims, "train")
-    predict(tX, tY, conv_parameters, fc_parameters, conv_dims, pool_dims, fc_dims, "test")
-    conv_parameters, fc_parameters
+    cvDims = [[5, 1, 2, 8], [3, 1, 1, 16]]
+    plDims = [[8, 8, "max"], [4, 4, "max"]]
+    fcDims = [64, 20, 6]
+    cvParams, fcParams = cnn(X, Y, cvDims, plDims, fcDims, num_iterations, learnRate, beta1, beta2, epsilon)
+    predict(X, Y, cvParams, fcParams, cvDims, plDims, fcDims, "train")
+    predict(tX, tY, cvParams, fcParams, cvDims, plDims, fcDims, "test")
+    cvParams, fcParams
 end
 
-conv_parameters, fc_parameters = main()
+cvParams, fcParams = main();

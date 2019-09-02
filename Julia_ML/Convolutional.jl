@@ -1,10 +1,10 @@
 using HDF5, Statistics
 using CUDAdrv, CuArrays, GPUArrays, CUDAnative
-# GPUArrays.allowscalar(false)
+GPUArrays.allowscalar(true)
 use_gpu = true
 dev = use_gpu ? CuArrays.CuArray : Array
 sum = use_gpu ? CUDAnative.sum : Base.sum
-max = use_gpu ? CUDAnative.max : Base.max
+max = Base.max
 
 onehot(Y, rng) = Int.(rng .== reshape(Y, 1, :))
 onecold(Y) = [Int(idx[1]) - 1 for idx in argmax(Y, dims = 1)]
@@ -83,6 +83,7 @@ function conv(X, params, hparams)
 end 
 
 function pool(Z, hparams)
+    Z = Array(Z)
     f, s, mode = hparams
     nHin, nWin, nCin, m = size(Z)
     nH, nW = dims_mapping(nHin, nWin, f, 0, s)
@@ -90,7 +91,7 @@ function pool(Z, hparams)
     func = mode == "max" ? maximum : mean
     for h in 1:nH, w in 1:nW
         hSlice, wSlice = slice(h, w, f, s)
-        P[h, w, :, :] = func(Z[hSlice, wSlice, :, :])
+        P[h, w, :, :] = func(Z[hSlice, wSlice, :, :], dims = 1:2)
     end
     P
 end
@@ -132,17 +133,20 @@ function poolback(dP, A, cvIdx, plDims, m)
     nH, nW, nCout = size(dP)
     plf, pls, mode = plDims[cvIdx]
     dA = devc(A)
+    dreluA = drelu(A)
+    dP = Array(dP)
+    A = Array(A)
     for h in 1:nH, w in 1:nW
         hSlice, wSlice = slice(h, w, plf, pls)
         if mode == "max"
             Aslice = A[hSlice, wSlice, :, :]
-            dpool = Aslice .== maximum(Aslice)
+            dpool = Aslice .== maximum(Aslice, dims = 1:2)
         else
             dpool = ones(plf, plf, nCout, m) / plf ^ 2
         end
-        dA[hSlice, wSlice, :, :] .+= dpool .* dP[h:h, w:w, :, :]
+        dA[hSlice, wSlice, :, :] .+= dev(dpool .* dP[h:h, w:w, :, :])
     end
-    dA .* drelu(A)
+    dA .* dreluA
 end
 
 function convback(dZ, Pprev, cvParams, cvDims, cvIdx, m)
@@ -219,9 +223,9 @@ end
 
 function main(num_iterations = 100, learnRate = 0.0001, beta1 = 0.9, beta2 = 0.999, epsilon = 1e-8)
     X, Y, tX, tY = load_data()
-    cvDims = [[5, 1, 2, 8], [3, 1, 1, 16]]
+    cvDims = [[5, 1, 2, 5], [3, 1, 1, 10]]
     plDims = [[8, 8, "max"], [4, 4, "max"]]
-    fcDims = [64, 20, 6]
+    fcDims = [40, 20, 6]
     cvParams, fcParams = cnn(X, Y, cvDims, plDims, fcDims, num_iterations, learnRate, beta1, beta2, epsilon)
     predict(X, Y, cvParams, fcParams, cvDims, plDims, fcDims, "train")
     predict(tX, tY, cvParams, fcParams, cvDims, plDims, fcDims, "test")

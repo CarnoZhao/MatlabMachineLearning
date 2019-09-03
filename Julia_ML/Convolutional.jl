@@ -82,6 +82,25 @@ function conv(X, params, hparams)
     relu(Z .+ b)
 end 
 
+function fastconv(X, params, hparams)
+    W, b = params
+    s, p = hparams
+    nHin, nWin, nCin, m = size(X)
+    f, f, nCin, nCout = size(W)
+    X = padding(X, p)
+    nH, nW = dims_mapping(nHin, nWin, f, p, s)
+    Xa = devz(f * f * nCin, nH * nW * m)
+    i = 1
+    for h in 1:nH, w in 1:nW
+        hSlice, wSlice = slice(h, w, f, s)
+        Xa[:, [i + k * nH * nW for k in 0:m - 1]] = reshape(X[hSlice, wSlice, :, :], :, m)
+    end
+    W = reshape(permutedims(W, [4, 1, 2, 3]), nCout, f * f * nCin)
+    Z = W * Xa
+    Z = permutedims(reshape(Z, nCout, nH, nW, m), [2, 3, 1, 4])
+    relu(Z .+ b)
+end
+
 function pool(Z, hparams)
     Z = Array(Z)
     f, s, mode = hparams
@@ -106,9 +125,11 @@ end
 function forward(P, cvParams, fcParams, cvDims, plDims, fcDims)
     cvCaches = []
     for cvIdx in 1:length(cvDims)
-        A = conv(P, cvParams[cvIdx], cvDims[cvIdx][2:3])
+        println("conv")
+        @time A = conv(P, cvParams[cvIdx], cvDims[cvIdx][2:3])
         push!(cvCaches, [P, A])
-        P = pool(A, plDims[cvIdx])
+        println("pool")
+        @time P = pool(A, plDims[cvIdx])
     end
     A, flatDims = flat(P)
     fcCaches = [A]
@@ -181,8 +202,10 @@ function backward(AL, Y, cvCaches, fcCaches, cvParams, fcParams, cvDims, plDims,
     cvGrads = []
     for cvIdx in length(cvCaches):-1:1
         Pprev, A = cvCaches[cvIdx]
-        dZ = poolback(dP, A, cvIdx, plDims, m)
-        dP, dW, db = convback(dZ, Pprev, cvParams, cvDims, cvIdx, m)
+        println("pool back")
+        @time dZ = poolback(dP, A, cvIdx, plDims, m)
+        println("conv back")
+        @time dP, dW, db = convback(dZ, Pprev, cvParams, cvDims, cvIdx, m)
         push!(cvGrads, [dW, db])
     end
     cvGrads, fcGrads

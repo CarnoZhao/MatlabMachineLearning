@@ -76,7 +76,7 @@ def accuracy(loader, model, name, device = 'cuda'):
             total += len(y)
     print("Accuracy in %s: %.3f" % (name, 100 * correct / total))
 
-def build_model(loader, num_iterations = 100, learning_rate = 0.0001, device = "cuda"):
+def build_model(loader, num_iterations = 100, learning_rate = 0.0003, device = "cuda"):
     model = Model()
     model = model.apply(init_method)
     model = model.to(device)
@@ -104,3 +104,5 @@ def main():
     accuracy(test_loader, model, 'test')
 
 main()
+# Accuracy in train: 94.907
+# Accuracy in test: 92.500

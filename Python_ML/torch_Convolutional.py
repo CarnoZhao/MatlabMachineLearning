@@ -1,3 +1,10 @@
+'''
+@Author: Xun Zhao
+@Date: 2019-09-03 14:00:36
+@LastEditors: Xun Zhao
+@LastEditTime: 2019-09-03 14:00:36
+@Description:
+'''
 import torch
 import torch.nn as nn
 import torch.nn.functional as funcs
